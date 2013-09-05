@@ -19,11 +19,7 @@
 
 package org.webinos.android.app.wrt.ui;
 
-import java.io.File;
 import java.io.IOException;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.util.concurrent.TimeUnit;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -33,7 +29,6 @@ import org.webinos.android.app.pzp.ConfigActivity;
 import org.webinos.android.app.wrt.mgr.WidgetManagerImpl;
 import org.webinos.android.app.wrt.mgr.WidgetManagerService;
 import org.webinos.android.util.AssetUtils;
-import org.webinos.android.util.ModuleUtils;
 
 import android.app.ActionBar;
 import android.app.Activity;
@@ -42,22 +37,30 @@ import android.app.ListActivity;
 import android.app.ProgressDialog;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
 import android.graphics.drawable.Drawable;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.BitmapFactory;
 import android.net.Uri;
-import android.os.AsyncTask;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
 import android.util.Log;
+import android.util.DisplayMetrics;
+import android.util.Base64;
 import android.view.ContextMenu;
 import android.view.Menu;
 import android.view.MenuInflater;
 import android.view.MenuItem;
 import android.view.View;
+import android.view.Surface;
 import android.widget.AdapterView.AdapterContextMenuInfo;
 import android.widget.ListView;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import android.content.BroadcastReceiver;
+import android.content.IntentFilter;
 
 public class WidgetListActivity extends ListActivity implements WidgetManagerService.WidgetManagerLaunchListener, WidgetManagerImpl.EventListener {
 	private static final String TAG = "ListActivity";
@@ -70,7 +73,7 @@ public class WidgetListActivity extends ListActivity implements WidgetManagerSer
 	static final String ID = "id";
 	static final String OPTS = "options";
 	
-	private static final int STORES_MENUITEM_BASE     = 100;
+	private static final int STORES_MENUITEM_BASE = 100;
 	static final int SCANNING_DIALOG          = 0;
 	static final int NO_WIDGETS_DIALOG        = 1;
 	static final int FOUND_WIDGETS_DIALOG     = 2;
@@ -80,9 +83,13 @@ public class WidgetListActivity extends ListActivity implements WidgetManagerSer
 	private Handler asyncRefreshHandler;
 	private String[] ids;
 	private Store[] stores;
-	private ProgressDialog progressDialog;
-	private boolean blocked;
-
+	private static ProgressDialog progressDialog;
+	private static int progress;
+	private static final int PROGRESS_MAX = 12;
+	private static boolean blocked;
+	
+	private ProgressEventReceiver eventReceiver;
+	
 	@Override
 	public void onCreate(Bundle bundle) {
 		super.onCreate(bundle);
@@ -109,15 +116,10 @@ public class WidgetListActivity extends ListActivity implements WidgetManagerSer
 			initList();
 		}
 		
-		// Populate stores array
 		scanner = new WidgetImportHelper(this);
-		DownloadStoreTask downloadStoreTask = new DownloadStoreTask();
-		downloadStoreTask.execute();
-		try {
-			downloadStoreTask.get(1, TimeUnit.SECONDS);
-		} catch (Throwable t) {
-			Log.i(TAG, "Getting app store information timed out.", t);
-		}
+		
+		// Populate stores array
+		stores = getStores();
 		
 		synchronized(this) {
 			if(mgr == null) {
@@ -126,35 +128,44 @@ public class WidgetListActivity extends ListActivity implements WidgetManagerSer
 					@Override
 					public void run() {
 						/* put up progress dialog until the service is available */
+						setRequestedOrientation(getScreenOrientation());
 						Activity context = WidgetListActivity.this;
 						progressDialog = new ProgressDialog(context);
-						progressDialog.setCancelable(true);
+						progressDialog.setCancelable(false);
 						progressDialog.setMessage(context.getString(R.string.initialising_runtime));
 						progressDialog.setProgressStyle(ProgressDialog.STYLE_HORIZONTAL);
-						progressDialog.setIndeterminate(true);
+						progressDialog.setIndeterminate(false);
+						progressDialog.setMax(PROGRESS_MAX);
 						progressDialog.show();
+						progressDialog.setProgressNumberFormat(null);
+						
+						//listen to the progress
+						Log.v(TAG, "Register for progress event notification");
+						ProgressEventReceiver eventReceiver = new ProgressEventReceiver();
+						//context.registerReceiver(eventReceiver, new IntentFilter(notificationResponseAction));
+						context.registerReceiver(eventReceiver, new IntentFilter("org.webinos.pzp.notification.response"));
 					}
 				});
 			}
 		}
 	}
-
+	
 	@Override
 	public void onPause() {
 		super.onPause();
 	}
-
+	
 	@Override
 	public void onDestroy() {
 		super.onDestroy();
 	}
-
+	
 	@Override
 	public void onCreateContextMenu(ContextMenu menu, View v, ContextMenu.ContextMenuInfo menuInfo) {
 		MenuInflater inflater = getMenuInflater();
 		inflater.inflate(R.menu.widget_list_context_menu, menu);
 	}
-
+	
 	@Override
 	public boolean onContextItemSelected(MenuItem item) {
 		AdapterContextMenuInfo info = (AdapterContextMenuInfo) item.getMenuInfo();
@@ -175,7 +186,7 @@ public class WidgetListActivity extends ListActivity implements WidgetManagerSer
 				return super.onContextItemSelected(item);
 		}
 	}
-
+	
 	@Override
 	public boolean onCreateOptionsMenu(Menu menu) {
 		// Inflate the menu items for use in the action bar
@@ -185,7 +196,7 @@ public class WidgetListActivity extends ListActivity implements WidgetManagerSer
 		if(stores != null) {
 			for(int i = 0; i < stores.length; i++) {
 				Store store = stores[i];
-				menu.add(Menu.NONE, STORES_MENUITEM_BASE + i, i+1, store.name)
+				menu.add(Menu.NONE, STORES_MENUITEM_BASE+i, i+1, store.name)
 					.setIcon(store.icon)
 					.setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
 			}
@@ -225,6 +236,7 @@ public class WidgetListActivity extends ListActivity implements WidgetManagerSer
 		return super.onOptionsItemSelected(item);
 	}
 	
+	@Override
 	public void onLaunch(final WidgetManagerImpl mgr) {
 		synchronized(this) {
 			if(blocked)
@@ -232,8 +244,11 @@ public class WidgetListActivity extends ListActivity implements WidgetManagerSer
 					@Override
 					public void run() {
 						if(progressDialog != null) {
+							progressDialog.setProgress(PROGRESS_MAX);
 							progressDialog.dismiss();
+							//TODO: unregister receiver -context.unregisterReceiver(eventReceiver);
 							progressDialog = null;
+							setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
 						}
 					}
 				});
@@ -241,6 +256,14 @@ public class WidgetListActivity extends ListActivity implements WidgetManagerSer
 		}
 		mgr.addEventListener(this);
 		asyncRefreshHandler.sendEmptyMessage(0);
+	}
+	
+	public static synchronized void onProgress(final int status) {
+		if(blocked && progressDialog != null) {
+			progress += status;
+			if (progress > PROGRESS_MAX) progress = PROGRESS_MAX;
+			progressDialog.setProgress(progress);
+		}
 	}
 	
 	@Override
@@ -278,40 +301,67 @@ public class WidgetListActivity extends ListActivity implements WidgetManagerSer
 		((TextView)findViewById(android.R.id.empty)).setText(getString(R.string.no_apps_installed));
 	}
 	
+	private int getScreenOrientation() {
+		int rotation = getWindowManager().getDefaultDisplay().getRotation();
+		DisplayMetrics dm = new DisplayMetrics();
+		getWindowManager().getDefaultDisplay().getMetrics(dm);
+		int width = dm.widthPixels;
+		int height = dm.heightPixels;
+		// if the device's natural orientation is portrait:
+		if ( (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_180) && height > width ||
+				(rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270) && width > height ) {
+			switch(rotation) {
+				case Surface.ROTATION_0:
+					return ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+				case Surface.ROTATION_90:
+					return ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
+				case Surface.ROTATION_180:
+					return ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT;
+				case Surface.ROTATION_270:
+					return ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE;
+				default:
+					Log.e(TAG, "Unknown screen orientation. Defaulting to portrait.");
+					return ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+			}
+		}
+		// if the device's natural orientation is landscape or if the device is
+		// square:
+		else {
+			switch(rotation) {
+				case Surface.ROTATION_0:
+					return ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
+				case Surface.ROTATION_90:
+					return ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+				case Surface.ROTATION_180:
+					return ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE;
+				case Surface.ROTATION_270:
+					return ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT;
+				default:
+					Log.e(TAG, "Unknown screen orientation. Defaulting to landscape.");
+					return ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
+			}
+		}
+	}
+	
 	/********************
 	 * Store handling
 	 ********************/
 	
-	private class DownloadStoreTask extends AsyncTask<Void, Void, Void> {
-		@Override
-		protected Void doInBackground(Void... params) {
-			stores = getStores();
-			return null;
-		}
-	}	
-	
-	private static class Store {
+	private class Store {
 		String name;
 		String description;
 		Uri location;
 		Drawable icon;
 	}
-
-	private static Store readStore(Context ctx, JSONObject json) {
+	
+	private Store readStore(Context ctx, JSONObject json) {
 		Store result = new Store();
 		try {
 			result.name = json.getString("name");
 			result.description = json.getString("description");
 			result.location = Uri.parse(json.getString("location"));
-			String iconURL = json.getString("logo");
-			try {
-				File iconFile = ModuleUtils.getResource(new URI(iconURL), true);
-				result.icon = Drawable.createFromPath(iconFile.getAbsolutePath());
-			} catch (IOException e) {
-				result.icon = ctx.getResources().getDrawable((R.drawable.webinos_icon));
-			} catch (URISyntaxException e) {
-				result.icon = ctx.getResources().getDrawable((R.drawable.webinos_icon));
-			}
+			byte[] decodedString = Base64.decode(json.getString("logo"), Base64.DEFAULT);
+			result.icon = (Drawable)new BitmapDrawable(BitmapFactory.decodeByteArray(decodedString, 0, decodedString.length));
 		} catch (JSONException e) {
 			result = null;
 		}
